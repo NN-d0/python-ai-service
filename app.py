@@ -1,9 +1,9 @@
+from typing import Any, Dict, List, Tuple
 
-from typing import Any, Dict, List
-
+import pymysql
 from flask import Flask, jsonify, request
 
-from config import APP_CONFIG, MODEL_CONFIG
+from config import APP_CONFIG, DB_CONFIG, MODEL_CONFIG, THRESHOLD_DEFAULTS
 
 app = Flask(__name__)
 
@@ -22,6 +22,65 @@ def fail(code: int, msg: str):
         "msg": msg,
         "data": None
     }), code
+
+
+def get_db_connection():
+    """
+    创建 MySQL 连接
+    """
+    return pymysql.connect(
+        host=DB_CONFIG["host"],
+        port=DB_CONFIG["port"],
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        database=DB_CONFIG["database"],
+        charset=DB_CONFIG["charset"],
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True
+    )
+
+
+def load_thresholds() -> Tuple[Dict[str, float], str]:
+    """
+    从 sys_config 读取告警阈值。
+    读取失败时，自动退回默认值，保证 AI 服务可用。
+    """
+    threshold_map = {
+        "alarm.power.threshold.dbm": THRESHOLD_DEFAULTS["alarm.power.threshold.dbm"],
+        "alarm.snr.threshold.db": THRESHOLD_DEFAULTS["alarm.snr.threshold.db"]
+    }
+
+    source = "default"
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            sql = """
+            SELECT config_key, config_value
+            FROM sys_config
+            WHERE config_key IN ('alarm.power.threshold.dbm', 'alarm.snr.threshold.db')
+            """
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+
+            for row in rows:
+                key = row.get("config_key")
+                value = row.get("config_value")
+                if key in threshold_map:
+                    try:
+                        threshold_map[key] = float(value)
+                    except Exception:
+                        pass
+
+            source = "sys_config"
+    except Exception as e:
+        print(f"[WARN] 读取 sys_config 阈值失败，改用默认值。error={e}")
+    finally:
+        if conn:
+            conn.close()
+
+    return threshold_map, source
 
 
 def normalize_points(points: Any) -> List[float]:
@@ -59,7 +118,7 @@ def estimate_active_width(points: List[float], threshold: float) -> int:
     return sum(1 for x in points if x >= threshold)
 
 
-def predict_rule(data: Dict[str, Any]) -> Dict[str, Any]:
+def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshold_source: str) -> Dict[str, Any]:
     """
     规则假模型：
     根据频段、占用带宽、曲线宽度、SNR、峰值功率做一个最小可运行分类
@@ -72,6 +131,9 @@ def predict_rule(data: Dict[str, Any]) -> Dict[str, Any]:
     channel_model = str(data.get("channel_model", "UNKNOWN"))
     power_points = normalize_points(data.get("power_points", []))
 
+    power_threshold = float(threshold_map["alarm.power.threshold.dbm"])
+    snr_threshold = float(threshold_map["alarm.snr.threshold.db"])
+
     if not power_points:
         return {
             "predicted_label": "UNKNOWN",
@@ -79,22 +141,24 @@ def predict_rule(data: Dict[str, Any]) -> Dict[str, Any]:
             "risk_level": "MEDIUM",
             "should_alarm": False,
             "reason": "未提供有效频谱采样点，无法做稳定识别。",
-            "model_name": MODEL_CONFIG["model_name"]
+            "model_name": MODEL_CONFIG["model_name"],
+            "thresholds": {
+                "power_alarm_threshold_dbm": power_threshold,
+                "snr_alarm_threshold_db": snr_threshold,
+                "source": threshold_source
+            }
         }
 
     noise_floor = estimate_noise_floor(power_points)
-    dynamic_peak = round(max(power_points), 2)
     active_threshold = noise_floor + 3.0
     active_bins = estimate_active_width(power_points, active_threshold)
 
     if occupied_bw <= 0 and bandwidth_khz > 0 and len(power_points) > 0:
         occupied_bw = round(active_bins * (bandwidth_khz / len(power_points)), 2)
 
-
-    # 1低频模拟段，更偏 AM / FM
-    # 2高频数字段，更偏 BPSK / QPSK / 16QAM
-    # 3占用带宽越宽，越可能是 FM / 16QAM / QPSK
-
+    # 1 低频模拟段，更偏 AM / FM
+    # 2 高频数字段，更偏 BPSK / QPSK / 16QAM
+    # 3 占用带宽越宽，越可能是 FM / 16QAM / QPSK
     if center_freq < 150:
         if occupied_bw >= 170:
             predicted_label = "FM"
@@ -124,9 +188,6 @@ def predict_rule(data: Dict[str, Any]) -> Dict[str, Any]:
     else:
         confidence = round(confidence, 2)
 
-    power_threshold = MODEL_CONFIG["power_alarm_threshold_dbm"]
-    snr_threshold = MODEL_CONFIG["snr_alarm_threshold_db"]
-
     should_alarm = (peak_power_dbm >= power_threshold) or (snr_db <= snr_threshold)
 
     if peak_power_dbm >= power_threshold + 5 or snr_db <= snr_threshold - 3:
@@ -135,26 +196,41 @@ def predict_rule(data: Dict[str, Any]) -> Dict[str, Any]:
         risk_level = "MEDIUM"
     else:
         risk_level = "LOW"
+
     extra_reason = (
         f" 峰值功率={peak_power_dbm}dBm，SNR={snr_db}dB，"
         f"估计底噪={noise_floor}dBm，活跃频点={active_bins}。"
     )
+
     return {
         "predicted_label": predicted_label,
         "confidence": confidence,
         "risk_level": risk_level,
         "should_alarm": should_alarm,
         "reason": reason + extra_reason,
-        "model_name": MODEL_CONFIG["model_name"]
+        "model_name": MODEL_CONFIG["model_name"],
+        "thresholds": {
+            "power_alarm_threshold_dbm": power_threshold,
+            "snr_alarm_threshold_db": snr_threshold,
+            "source": threshold_source
+        }
     }
+
 
 @app.get("/health")
 def health():
+    threshold_map, threshold_source = load_thresholds()
     return success({
         "service": "radio-spectrum-ai",
         "model": MODEL_CONFIG["model_name"],
-        "status": "UP"
+        "status": "UP",
+        "thresholds": {
+            "power_alarm_threshold_dbm": threshold_map["alarm.power.threshold.dbm"],
+            "snr_alarm_threshold_db": threshold_map["alarm.snr.threshold.db"],
+            "source": threshold_source
+        }
     }, "AI服务正常")
+
 
 @app.post("/predict")
 def predict():
@@ -175,7 +251,8 @@ def predict():
             if field not in data:
                 return fail(400, f"缺少必填字段：{field}")
 
-        result = predict_rule(data)
+        threshold_map, threshold_source = load_thresholds()
+        result = predict_rule(data, threshold_map, threshold_source)
         return success(result, "推理成功")
     except Exception as e:
         return fail(500, f"AI推理异常：{str(e)}")
