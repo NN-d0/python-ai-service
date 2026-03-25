@@ -1,13 +1,34 @@
-from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pymysql
+import torch
+import torch.nn as nn
 from flask import Flask, jsonify, request
 
 from config import APP_CONFIG, DB_CONFIG, MODEL_CONFIG, THRESHOLD_DEFAULTS
 
 app = Flask(__name__)
 
+# =========================
+# 全局缓存：CNN 模型
+# =========================
+_CNN_MODEL = None
+_CNN_MODEL_META = {
+    "loaded": False,
+    "checkpoint_path": MODEL_CONFIG["cnn_checkpoint_path"],
+    "model_name": MODEL_CONFIG["cnn_model_name"],
+    "input_shape": [2, MODEL_CONFIG["cnn_input_length"]],
+    "label_map": MODEL_CONFIG["label_map"],
+    "idx_to_name": {v: k for k, v in MODEL_CONFIG["label_map"].items()},
+    "error": None,
+}
 
+
+# =========================
+# 通用返回
+# =========================
 def success(data: Any = None, msg: str = "操作成功"):
     return jsonify({
         "code": 200,
@@ -24,10 +45,10 @@ def fail(code: int, msg: str):
     }), code
 
 
+# =========================
+# 数据库与阈值
+# =========================
 def get_db_connection():
-    """
-    创建 MySQL 连接
-    """
     return pymysql.connect(
         host=DB_CONFIG["host"],
         port=DB_CONFIG["port"],
@@ -41,10 +62,6 @@ def get_db_connection():
 
 
 def load_thresholds() -> Tuple[Dict[str, float], str]:
-    """
-    从 sys_config 读取告警阈值。
-    读取失败时，自动退回默认值，保证 AI 服务可用。
-    """
     threshold_map = {
         "alarm.power.threshold.dbm": THRESHOLD_DEFAULTS["alarm.power.threshold.dbm"],
         "alarm.snr.threshold.db": THRESHOLD_DEFAULTS["alarm.snr.threshold.db"]
@@ -83,10 +100,10 @@ def load_thresholds() -> Tuple[Dict[str, float], str]:
     return threshold_map, source
 
 
+# =========================
+# 规则模型相关
+# =========================
 def normalize_points(points: Any) -> List[float]:
-    """
-    把 power_points 统一转成 float 列表
-    """
     if not isinstance(points, list):
         return []
 
@@ -100,9 +117,6 @@ def normalize_points(points: Any) -> List[float]:
 
 
 def estimate_noise_floor(points: List[float]) -> float:
-    """
-    用最小 20% 点估计底噪
-    """
     if not points:
         return -90.0
 
@@ -112,17 +126,10 @@ def estimate_noise_floor(points: List[float]) -> float:
 
 
 def estimate_active_width(points: List[float], threshold: float) -> int:
-    """
-    估计活跃频点数量
-    """
     return sum(1 for x in points if x >= threshold)
 
 
 def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshold_source: str) -> Dict[str, Any]:
-    """
-    规则假模型：
-    根据频段、占用带宽、曲线宽度、SNR、峰值功率做一个最小可运行分类
-    """
     center_freq = float(data.get("center_freq_mhz", 0))
     bandwidth_khz = float(data.get("bandwidth_khz", 0))
     peak_power_dbm = float(data.get("peak_power_dbm", -90))
@@ -141,7 +148,9 @@ def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshol
             "risk_level": "MEDIUM",
             "should_alarm": False,
             "reason": "未提供有效频谱采样点，无法做稳定识别。",
-            "model_name": MODEL_CONFIG["model_name"],
+            "model_name": MODEL_CONFIG["rule_model_name"],
+            "inference_mode": "rule",
+            "fallback_used": False,
             "thresholds": {
                 "power_alarm_threshold_dbm": power_threshold,
                 "snr_alarm_threshold_db": snr_threshold,
@@ -156,9 +165,6 @@ def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshol
     if occupied_bw <= 0 and bandwidth_khz > 0 and len(power_points) > 0:
         occupied_bw = round(active_bins * (bandwidth_khz / len(power_points)), 2)
 
-    # 1 低频模拟段，更偏 AM / FM
-    # 2 高频数字段，更偏 BPSK / QPSK / 16QAM
-    # 3 占用带宽越宽，越可能是 FM / 16QAM / QPSK
     if center_freq < 150:
         if occupied_bw >= 170:
             predicted_label = "FM"
@@ -182,7 +188,6 @@ def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshol
             reason = "处于数字调制频段，占用带宽较宽，更接近 16QAM。"
             confidence = 0.85
 
-    # 信道影响轻微修正置信度
     if channel_model in ("Rayleigh", "CarrierOffset", "SampleRateError"):
         confidence = max(0.60, round(confidence - 0.06, 2))
     else:
@@ -208,7 +213,9 @@ def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshol
         "risk_level": risk_level,
         "should_alarm": should_alarm,
         "reason": reason + extra_reason,
-        "model_name": MODEL_CONFIG["model_name"],
+        "model_name": MODEL_CONFIG["rule_model_name"],
+        "inference_mode": "rule",
+        "fallback_used": False,
         "thresholds": {
             "power_alarm_threshold_dbm": power_threshold,
             "snr_alarm_threshold_db": snr_threshold,
@@ -217,13 +224,303 @@ def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshol
     }
 
 
+# =========================
+# 1D-CNN 模型定义（需与训练脚本保持一致）
+# =========================
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, pool: bool = True):
+        super().__init__()
+        padding = kernel_size // 2
+        layers = [
+            nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=padding),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+        ]
+        if pool:
+            layers.append(nn.MaxPool1d(kernel_size=2))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class OneDCNNClassifier(nn.Module):
+    def __init__(self, num_classes: int = 5):
+        super().__init__()
+        self.features = nn.Sequential(
+            ConvBlock(2, 32, kernel_size=7, pool=True),
+            ConvBlock(32, 64, kernel_size=5, pool=True),
+            ConvBlock(64, 128, kernel_size=3, pool=True),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
+            nn.Linear(64, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+
+# =========================
+# CNN 模型加载与预处理
+# =========================
+def get_compute_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def normalize_iq_per_channel(iq: np.ndarray) -> np.ndarray:
+    iq = iq.astype(np.float32).copy()
+    for c in range(iq.shape[0]):
+        mean = iq[c].mean()
+        std = iq[c].std() + 1e-6
+        iq[c] = (iq[c] - mean) / std
+    return iq
+
+
+def resize_iq_to_target_length(iq: np.ndarray, target_len: int) -> np.ndarray:
+    """
+    将 [2, L] 插值到 [2, target_len]
+    """
+    if iq.shape[1] == target_len:
+        return iq.astype(np.float32)
+
+    old_idx = np.linspace(0, 1, iq.shape[1])
+    new_idx = np.linspace(0, 1, target_len)
+
+    out = np.zeros((2, target_len), dtype=np.float32)
+    out[0] = np.interp(new_idx, old_idx, iq[0]).astype(np.float32)
+    out[1] = np.interp(new_idx, old_idx, iq[1]).astype(np.float32)
+    return out
+
+
+def parse_iq_input(data: Dict[str, Any]) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    支持两种输入方式：
+    1. iq: [[I...], [Q...]]
+    2. i_points + q_points
+    """
+    if "iq" in data:
+        iq = data.get("iq")
+        if not isinstance(iq, list) or len(iq) != 2:
+            return None, "字段 iq 必须是长度为 2 的二维数组，例如 [[I...],[Q...]]"
+
+        try:
+            i_arr = np.array(iq[0], dtype=np.float32)
+            q_arr = np.array(iq[1], dtype=np.float32)
+        except Exception:
+            return None, "字段 iq 无法转换为有效浮点数组"
+
+        if len(i_arr) == 0 or len(q_arr) == 0:
+            return None, "字段 iq 不能为空"
+
+        if len(i_arr) != len(q_arr):
+            return None, "I/Q 序列长度不一致"
+
+        return np.stack([i_arr, q_arr], axis=0).astype(np.float32), None
+
+    if "i_points" in data and "q_points" in data:
+        try:
+            i_arr = np.array(data.get("i_points"), dtype=np.float32)
+            q_arr = np.array(data.get("q_points"), dtype=np.float32)
+        except Exception:
+            return None, "字段 i_points / q_points 无法转换为有效浮点数组"
+
+        if len(i_arr) == 0 or len(q_arr) == 0:
+            return None, "字段 i_points / q_points 不能为空"
+
+        if len(i_arr) != len(q_arr):
+            return None, "字段 i_points / q_points 长度不一致"
+
+        return np.stack([i_arr, q_arr], axis=0).astype(np.float32), None
+
+    return None, "当前请求未提供 iq 或 i_points/q_points，无法执行 CNN 推理"
+
+
+def load_cnn_model_if_needed() -> Tuple[Optional[nn.Module], Dict[str, Any]]:
+    global _CNN_MODEL, _CNN_MODEL_META
+
+    if _CNN_MODEL is not None and _CNN_MODEL_META["loaded"]:
+        return _CNN_MODEL, _CNN_MODEL_META
+
+    checkpoint_path = Path(MODEL_CONFIG["cnn_checkpoint_path"])
+    if not checkpoint_path.exists():
+        _CNN_MODEL_META["loaded"] = False
+        _CNN_MODEL_META["error"] = f"未找到模型文件：{checkpoint_path}"
+        print(f"[WARN] {_CNN_MODEL_META['error']}")
+        return None, _CNN_MODEL_META
+
+    try:
+        device = get_compute_device()
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        label_map = checkpoint.get("label_map", MODEL_CONFIG["label_map"])
+        idx_to_name = checkpoint.get(
+            "idx_to_name",
+            {int(v): k for k, v in label_map.items()}
+        )
+
+        model = OneDCNNClassifier(
+            num_classes=int(checkpoint.get("num_classes", MODEL_CONFIG["cnn_num_classes"]))
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.to(device)
+        model.eval()
+
+        _CNN_MODEL = model
+        _CNN_MODEL_META = {
+            "loaded": True,
+            "checkpoint_path": str(checkpoint_path),
+            "model_name": checkpoint.get("model_name", MODEL_CONFIG["cnn_model_name"]),
+            "input_shape": checkpoint.get("input_shape", [2, MODEL_CONFIG["cnn_input_length"]]),
+            "label_map": label_map,
+            "idx_to_name": {int(k): v for k, v in idx_to_name.items()} if isinstance(idx_to_name, dict) else idx_to_name,
+            "error": None,
+            "device": str(device),
+        }
+
+        print(f"[INFO] CNN 模型加载成功：{checkpoint_path}")
+        return _CNN_MODEL, _CNN_MODEL_META
+    except Exception as e:
+        _CNN_MODEL = None
+        _CNN_MODEL_META["loaded"] = False
+        _CNN_MODEL_META["error"] = f"模型加载失败：{e}"
+        print(f"[WARN] {_CNN_MODEL_META['error']}")
+        return None, _CNN_MODEL_META
+
+
+def determine_risk_level(peak_power_dbm: float, snr_db: float, power_threshold: float, snr_threshold: float) -> str:
+    should_alarm = (peak_power_dbm >= power_threshold) or (snr_db <= snr_threshold)
+    if peak_power_dbm >= power_threshold + 5 or snr_db <= snr_threshold - 3:
+        return "HIGH"
+    if should_alarm:
+        return "MEDIUM"
+    return "LOW"
+
+
+def predict_cnn(data: Dict[str, Any], threshold_map: Dict[str, float], threshold_source: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    model, meta = load_cnn_model_if_needed()
+    if model is None:
+        return None, meta.get("error") or "CNN 模型不可用"
+
+    iq, iq_error = parse_iq_input(data)
+    if iq is None:
+        return None, iq_error
+
+    target_len = int(meta.get("input_shape", [2, MODEL_CONFIG["cnn_input_length"]])[1])
+    iq = resize_iq_to_target_length(iq, target_len)
+
+    if MODEL_CONFIG.get("cnn_normalize_per_channel", True):
+        iq = normalize_iq_per_channel(iq)
+
+    x = torch.tensor(iq, dtype=torch.float32).unsqueeze(0).to(get_compute_device())
+
+    with torch.no_grad():
+        logits = model(x)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+        pred_idx = int(np.argmax(probs))
+        confidence = float(probs[pred_idx])
+
+    idx_to_name = meta.get("idx_to_name", {v: k for k, v in MODEL_CONFIG["label_map"].items()})
+    predicted_label = idx_to_name.get(pred_idx, f"class_{pred_idx}")
+
+    peak_power_dbm = float(data.get("peak_power_dbm", -90))
+    snr_db = float(data.get("snr_db", 0))
+
+    power_threshold = float(threshold_map["alarm.power.threshold.dbm"])
+    snr_threshold = float(threshold_map["alarm.snr.threshold.db"])
+    should_alarm = (peak_power_dbm >= power_threshold) or (snr_db <= snr_threshold)
+    risk_level = determine_risk_level(peak_power_dbm, snr_db, power_threshold, snr_threshold)
+
+    reason = (
+        f"已使用 1D-CNN 模型完成推理，预测标签={predicted_label}，"
+        f"置信度={confidence:.4f}。"
+    )
+
+    return {
+        "predicted_label": predicted_label,
+        "confidence": round(confidence, 4),
+        "risk_level": risk_level,
+        "should_alarm": should_alarm,
+        "reason": reason,
+        "model_name": meta.get("model_name", MODEL_CONFIG["cnn_model_name"]),
+        "inference_mode": "cnn",
+        "fallback_used": False,
+        "thresholds": {
+            "power_alarm_threshold_dbm": power_threshold,
+            "snr_alarm_threshold_db": snr_threshold,
+            "source": threshold_source
+        }
+    }, None
+
+
+# =========================
+# 推理模式控制
+# =========================
+def resolve_predict_mode(data: Dict[str, Any]) -> str:
+    mode = str(data.get("model_type", MODEL_CONFIG["default_mode"])).strip().lower()
+    if mode not in ("rule", "cnn", "auto"):
+        mode = MODEL_CONFIG["default_mode"]
+    return mode
+
+
+def predict_with_fallback(data: Dict[str, Any], threshold_map: Dict[str, float], threshold_source: str) -> Dict[str, Any]:
+    mode = resolve_predict_mode(data)
+
+    if mode == "rule":
+        result = predict_rule(data, threshold_map, threshold_source)
+        result["request_mode"] = mode
+        return result
+
+    if mode in ("cnn", "auto"):
+        cnn_result, cnn_error = predict_cnn(data, threshold_map, threshold_source)
+        if cnn_result is not None:
+            cnn_result["request_mode"] = mode
+            return cnn_result
+
+        if not MODEL_CONFIG.get("allow_rule_fallback", True):
+            raise RuntimeError(f"CNN 推理失败，且未启用规则兜底：{cnn_error}")
+
+        fallback_result = predict_rule(data, threshold_map, threshold_source)
+        fallback_result["fallback_used"] = True
+        fallback_result["request_mode"] = mode
+        fallback_result["reason"] = f"CNN 推理未启用，已回退规则模型。原因：{cnn_error} " + fallback_result["reason"]
+        return fallback_result
+
+    result = predict_rule(data, threshold_map, threshold_source)
+    result["request_mode"] = mode
+    return result
+
+
+# =========================
+# 路由
+# =========================
 @app.get("/health")
 def health():
     threshold_map, threshold_source = load_thresholds()
+    _, cnn_meta = load_cnn_model_if_needed()
+
     return success({
         "service": "radio-spectrum-ai",
-        "model": MODEL_CONFIG["model_name"],
         "status": "UP",
+        "default_mode": MODEL_CONFIG["default_mode"],
+        "rule_model": {
+            "name": MODEL_CONFIG["rule_model_name"],
+            "available": True
+        },
+        "cnn_model": {
+            "name": cnn_meta.get("model_name", MODEL_CONFIG["cnn_model_name"]),
+            "available": bool(cnn_meta.get("loaded", False)),
+            "checkpoint_path": cnn_meta.get("checkpoint_path"),
+            "device": cnn_meta.get("device"),
+            "input_shape": cnn_meta.get("input_shape"),
+            "error": cnn_meta.get("error")
+        },
         "thresholds": {
             "power_alarm_threshold_dbm": threshold_map["alarm.power.threshold.dbm"],
             "snr_alarm_threshold_db": threshold_map["alarm.snr.threshold.db"],
@@ -246,13 +543,12 @@ def predict():
             "snr_db",
             "power_points"
         ]
-
         for field in required_fields:
             if field not in data:
                 return fail(400, f"缺少必填字段：{field}")
 
         threshold_map, threshold_source = load_thresholds()
-        result = predict_rule(data, threshold_map, threshold_source)
+        result = predict_with_fallback(data, threshold_map, threshold_source)
         return success(result, "推理成功")
     except Exception as e:
         return fail(500, f"AI推理异常：{str(e)}")

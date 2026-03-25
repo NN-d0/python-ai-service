@@ -1,3 +1,7 @@
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+
 APP_CONFIG = {
     "host": "0.0.0.0",
     "port": 9300,
@@ -14,7 +18,45 @@ DB_CONFIG = {
 }
 
 MODEL_CONFIG = {
-    "model_name": "rule-model-v1"
+    # 默认推理模式：
+    # rule -> 强制规则模型
+    # cnn  -> 优先 CNN，失败后按 allow_rule_fallback 决定是否回退
+    # auto -> 有效 IQ + 成功加载模型时走 CNN，否则走 rule
+    "default_mode": "auto",
+
+    # 规则模型名称
+    "rule_model_name": "rule-model-v1",
+
+    # CNN 模型名称
+    "cnn_model_name": "1dcnn-v1",
+
+    # 允许 CNN 失败后自动回退到规则模型
+    "allow_rule_fallback": True,
+
+    # 训练输出的模型路径
+    # 当前假设目录结构为：
+    # 项目根目录/
+    # ├─ python-ai-service-main/
+    # └─ ai-research/
+    "cnn_checkpoint_path": str((BASE_DIR.parent / "ai-research" / "models" / "best_1dcnn.pt").resolve()),
+
+    # CNN 输入长度，需与 train_1dcnn.py 保持一致
+    "cnn_input_length": 256,
+
+    # CNN 分类数
+    "cnn_num_classes": 5,
+
+    # 与训练脚本一致：每通道标准化
+    "cnn_normalize_per_channel": True,
+
+    # 标签兜底映射
+    "label_map": {
+        "AM": 0,
+        "FM": 1,
+        "BPSK": 2,
+        "QPSK": 3,
+        "16QAM": 4
+    }
 }
 
 THRESHOLD_DEFAULTS = {
