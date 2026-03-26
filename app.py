@@ -497,36 +497,81 @@ def predict_with_fallback(data: Dict[str, Any], threshold_map: Dict[str, float],
     return result
 
 
-# =========================
-# 路由
-# =========================
-@app.get("/health")
-def health():
+
+def build_health_payload() -> Dict[str, Any]:
     threshold_map, threshold_source = load_thresholds()
     _, cnn_meta = load_cnn_model_if_needed()
 
-    return success({
+    checkpoint_path = Path(cnn_meta.get("checkpoint_path") or MODEL_CONFIG["cnn_checkpoint_path"]).resolve()
+    checkpoint_exists = checkpoint_path.exists()
+    checkpoint_is_file = checkpoint_path.is_file()
+
+    default_mode = str(MODEL_CONFIG["default_mode"]).strip().lower()
+    allow_rule_fallback = bool(MODEL_CONFIG.get("allow_rule_fallback", True))
+    cnn_available = bool(cnn_meta.get("loaded", False))
+
+    if default_mode == "rule":
+        risk_flag = False
+        risk_level = "LOW"
+        risk_reason = "当前默认模式为 RULE，在线推理不依赖 CNN 模型，不存在 RULE 兜底风险。"
+    elif cnn_available:
+        risk_flag = False
+        risk_level = "LOW"
+        risk_reason = "CNN 模型已成功加载，当前不存在 RULE 兜底风险。"
+    else:
+        risk_flag = True
+        risk_level = "HIGH"
+        if allow_rule_fallback:
+            risk_reason = "默认模式依赖 CNN，但 CNN 当前不可用；后续推理会自动回退到 RULE。"
+        else:
+            risk_reason = "默认模式依赖 CNN，但 CNN 当前不可用；且未开启 RULE 回退，推理可能直接失败。"
+
+    summary = (
+        f"status=UP, defaultMode={default_mode}, "
+        f"cnnAvailable={'true' if cnn_available else 'false'}, "
+        f"checkpointExists={'true' if checkpoint_exists else 'false'}, "
+        f"fallbackRisk={'true' if risk_flag else 'false'}"
+    )
+
+    return {
         "service": "radio-spectrum-ai",
         "status": "UP",
-        "default_mode": MODEL_CONFIG["default_mode"],
+        "default_mode": default_mode,
+        "allow_rule_fallback": allow_rule_fallback,
         "rule_model": {
             "name": MODEL_CONFIG["rule_model_name"],
             "available": True
         },
         "cnn_model": {
             "name": cnn_meta.get("model_name", MODEL_CONFIG["cnn_model_name"]),
-            "available": bool(cnn_meta.get("loaded", False)),
-            "checkpoint_path": cnn_meta.get("checkpoint_path"),
+            "available": cnn_available,
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_exists": checkpoint_exists,
+            "checkpoint_is_file": checkpoint_is_file,
             "device": cnn_meta.get("device"),
             "input_shape": cnn_meta.get("input_shape"),
             "error": cnn_meta.get("error")
+        },
+        "fallback_risk": {
+            "has_risk": risk_flag,
+            "level": risk_level,
+            "reason": risk_reason
         },
         "thresholds": {
             "power_alarm_threshold_dbm": threshold_map["alarm.power.threshold.dbm"],
             "snr_alarm_threshold_db": threshold_map["alarm.snr.threshold.db"],
             "source": threshold_source
-        }
-    }, "AI服务正常")
+        },
+        "summary": summary
+    }
+
+
+# =========================
+# 路由
+# =========================
+@app.get("/health")
+def health():
+    return success(build_health_payload(), "AI服务正常")
 
 
 @app.post("/predict")
