@@ -34,19 +34,15 @@ MODEL_CONFIG = {
     "allow_rule_fallback": True,
 
     # 训练输出的模型路径
-    # 当前假设目录结构为：
-    # 项目根目录/
-    # ├─ python-ai-service-main/
-    # └─ ai-research/
     "cnn_checkpoint_path": str((BASE_DIR.parent / "ai-research" / "models" / "best_1dcnn.pt").resolve()),
 
-    # CNN 输入长度，需与 train_1dcnn.py 保持一致
+    # CNN 输入长度
     "cnn_input_length": 256,
 
     # CNN 分类数
     "cnn_num_classes": 5,
 
-    # 与训练脚本一致：每通道标准化
+    # 每通道标准化
     "cnn_normalize_per_channel": True,
 
     # 标签兜底映射

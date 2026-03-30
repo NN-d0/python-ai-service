@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -150,7 +151,9 @@ def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshol
             "reason": "未提供有效频谱采样点，无法做稳定识别。",
             "model_name": MODEL_CONFIG["rule_model_name"],
             "inference_mode": "rule",
+            "actual_mode": "rule",
             "fallback_used": False,
+            "fallback_reason": "",
             "thresholds": {
                 "power_alarm_threshold_dbm": power_threshold,
                 "snr_alarm_threshold_db": snr_threshold,
@@ -215,7 +218,9 @@ def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshol
         "reason": reason + extra_reason,
         "model_name": MODEL_CONFIG["rule_model_name"],
         "inference_mode": "rule",
+        "actual_mode": "rule",
         "fallback_used": False,
+        "fallback_reason": "",
         "thresholds": {
             "power_alarm_threshold_dbm": power_threshold,
             "snr_alarm_threshold_db": snr_threshold,
@@ -225,7 +230,7 @@ def predict_rule(data: Dict[str, Any], threshold_map: Dict[str, float], threshol
 
 
 # =========================
-# 1D-CNN 模型定义（需与训练脚本保持一致）
+# 1D-CNN 模型定义
 # =========================
 class ConvBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, pool: bool = True):
@@ -299,48 +304,110 @@ def resize_iq_to_target_length(iq: np.ndarray, target_len: int) -> np.ndarray:
     return out
 
 
+
+def parse_numeric_sequence(value: Any, field_name: str) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    把输入安全转换成一维 float32 数组。
+    允许：
+    1. 原生 list / tuple
+    2. numpy.ndarray
+    3. JSON 字符串形式的数组，例如 "[0.1, 0.2]"
+    不允许：
+    1. 单个标量
+    2. 空字符串
+    3. 维度为 0 的 numpy 标量数组
+    """
+    if value is None:
+        return None, f"字段 {field_name} 不能为空"
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None, f"字段 {field_name} 不能为空字符串"
+        try:
+            value = json.loads(raw)
+        except Exception:
+            return None, f"字段 {field_name} 必须是数值数组或数组 JSON 字符串"
+
+    if isinstance(value, (int, float, np.number)):
+        return None, f"字段 {field_name} 必须是数组，不能是单个数值"
+
+    if isinstance(value, np.ndarray):
+        arr = value.astype(np.float32, copy=False)
+    elif isinstance(value, (list, tuple)):
+        try:
+            arr = np.asarray(list(value), dtype=np.float32)
+        except Exception:
+            return None, f"字段 {field_name} 无法转换为有效浮点数组"
+    else:
+        return None, f"字段 {field_name} 类型非法，必须是数组"
+
+    if arr.ndim == 0:
+        return None, f"字段 {field_name} 必须是数组，不能是标量"
+
+    if arr.ndim > 1:
+        arr = arr.reshape(-1)
+
+    if arr.size == 0:
+        return None, f"字段 {field_name} 不能为空"
+
+    return arr.astype(np.float32), None
+
+
 def parse_iq_input(data: Dict[str, Any]) -> Tuple[Optional[np.ndarray], Optional[str]]:
     """
     支持两种输入方式：
     1. iq: [[I...], [Q...]]
     2. i_points + q_points
+
+    关键修复：
+    - 避免对 0 维 numpy 数组直接 len(...)，从而触发 len() of unsized object
+    - 允许字符串形式的 JSON 数组
+    - 当输入不合法时返回可读错误，由上层自动回退 rule，不再直接 500
     """
     if "iq" in data:
         iq = data.get("iq")
-        if not isinstance(iq, list) or len(iq) != 2:
+
+        if isinstance(iq, str):
+            raw = iq.strip()
+            if not raw:
+                return None, "字段 iq 不能为空字符串"
+            try:
+                iq = json.loads(raw)
+            except Exception:
+                return None, "字段 iq 必须是长度为 2 的二维数组，例如 [[I...],[Q...]]"
+
+        if not isinstance(iq, (list, tuple)) or len(iq) != 2:
             return None, "字段 iq 必须是长度为 2 的二维数组，例如 [[I...],[Q...]]"
 
-        try:
-            i_arr = np.array(iq[0], dtype=np.float32)
-            q_arr = np.array(iq[1], dtype=np.float32)
-        except Exception:
-            return None, "字段 iq 无法转换为有效浮点数组"
+        i_arr, i_err = parse_numeric_sequence(iq[0], "iq[0]")
+        if i_err:
+            return None, i_err
 
-        if len(i_arr) == 0 or len(q_arr) == 0:
-            return None, "字段 iq 不能为空"
+        q_arr, q_err = parse_numeric_sequence(iq[1], "iq[1]")
+        if q_err:
+            return None, q_err
 
-        if len(i_arr) != len(q_arr):
+        if i_arr.shape[0] != q_arr.shape[0]:
             return None, "I/Q 序列长度不一致"
 
         return np.stack([i_arr, q_arr], axis=0).astype(np.float32), None
 
     if "i_points" in data and "q_points" in data:
-        try:
-            i_arr = np.array(data.get("i_points"), dtype=np.float32)
-            q_arr = np.array(data.get("q_points"), dtype=np.float32)
-        except Exception:
-            return None, "字段 i_points / q_points 无法转换为有效浮点数组"
+        i_arr, i_err = parse_numeric_sequence(data.get("i_points"), "i_points")
+        if i_err:
+            return None, i_err
 
-        if len(i_arr) == 0 or len(q_arr) == 0:
-            return None, "字段 i_points / q_points 不能为空"
+        q_arr, q_err = parse_numeric_sequence(data.get("q_points"), "q_points")
+        if q_err:
+            return None, q_err
 
-        if len(i_arr) != len(q_arr):
+        if i_arr.shape[0] != q_arr.shape[0]:
             return None, "字段 i_points / q_points 长度不一致"
 
         return np.stack([i_arr, q_arr], axis=0).astype(np.float32), None
 
     return None, "当前请求未提供 iq 或 i_points/q_points，无法执行 CNN 推理"
-
 
 def load_cnn_model_if_needed() -> Tuple[Optional[nn.Module], Dict[str, Any]]:
     global _CNN_MODEL, _CNN_MODEL_META
@@ -450,7 +517,9 @@ def predict_cnn(data: Dict[str, Any], threshold_map: Dict[str, float], threshold
         "reason": reason,
         "model_name": meta.get("model_name", MODEL_CONFIG["cnn_model_name"]),
         "inference_mode": "cnn",
+        "actual_mode": "cnn",
         "fallback_used": False,
+        "fallback_reason": "",
         "thresholds": {
             "power_alarm_threshold_dbm": power_threshold,
             "snr_alarm_threshold_db": snr_threshold,
@@ -475,12 +544,19 @@ def predict_with_fallback(data: Dict[str, Any], threshold_map: Dict[str, float],
     if mode == "rule":
         result = predict_rule(data, threshold_map, threshold_source)
         result["request_mode"] = mode
+        result["actual_mode"] = "rule"
         return result
 
     if mode in ("cnn", "auto"):
-        cnn_result, cnn_error = predict_cnn(data, threshold_map, threshold_source)
+        try:
+            cnn_result, cnn_error = predict_cnn(data, threshold_map, threshold_source)
+        except Exception as e:
+            cnn_result = None
+            cnn_error = f"CNN 推理异常：{e}"
+
         if cnn_result is not None:
             cnn_result["request_mode"] = mode
+            cnn_result["actual_mode"] = "cnn"
             return cnn_result
 
         if not MODEL_CONFIG.get("allow_rule_fallback", True):
@@ -489,11 +565,14 @@ def predict_with_fallback(data: Dict[str, Any], threshold_map: Dict[str, float],
         fallback_result = predict_rule(data, threshold_map, threshold_source)
         fallback_result["fallback_used"] = True
         fallback_result["request_mode"] = mode
+        fallback_result["actual_mode"] = "rule"
+        fallback_result["fallback_reason"] = str(cnn_error)
         fallback_result["reason"] = f"CNN 推理未启用，已回退规则模型。原因：{cnn_error} " + fallback_result["reason"]
         return fallback_result
 
     result = predict_rule(data, threshold_map, threshold_source)
     result["request_mode"] = mode
+    result["actual_mode"] = "rule"
     return result
 
 
@@ -513,18 +592,18 @@ def build_health_payload() -> Dict[str, Any]:
     if default_mode == "rule":
         risk_flag = False
         risk_level = "LOW"
-        risk_reason = "当前默认模式为 RULE，在线推理不依赖 CNN 模型，不存在 RULE 兜底风险。"
+        risk_reason = "当前默认模式为 RULE，在线推理固定走规则模型。"
     elif cnn_available:
         risk_flag = False
         risk_level = "LOW"
-        risk_reason = "CNN 模型已成功加载，当前不存在 RULE 兜底风险。"
+        risk_reason = "CNN 模型已成功加载，AUTO 或 CNN 模式均可正常使用。"
     else:
         risk_flag = True
         risk_level = "HIGH"
         if allow_rule_fallback:
-            risk_reason = "默认模式依赖 CNN，但 CNN 当前不可用；后续推理会自动回退到 RULE。"
+            risk_reason = "默认模式为 AUTO/CNN，但 CNN 当前不可用；后续推理会自动回退到 RULE。"
         else:
-            risk_reason = "默认模式依赖 CNN，但 CNN 当前不可用；且未开启 RULE 回退，推理可能直接失败。"
+            risk_reason = "默认模式为 AUTO/CNN，但 CNN 当前不可用；且未开启 RULE 回退，推理可能直接失败。"
 
     summary = (
         f"status=UP, defaultMode={default_mode}, "
@@ -596,8 +675,8 @@ def predict():
         result = predict_with_fallback(data, threshold_map, threshold_source)
         return success(result, "推理成功")
     except Exception as e:
+        app.logger.exception("AI /predict 处理异常")
         return fail(500, f"AI推理异常：{str(e)}")
-
 
 if __name__ == "__main__":
     app.run(
