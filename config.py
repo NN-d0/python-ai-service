@@ -18,7 +18,6 @@ DB_CONFIG = {
 }
 
 MODEL_CONFIG = {
-    # 默认推理模式：
     # rule -> 强制规则模型
     # cnn  -> 优先 CNN，失败后按 allow_rule_fallback 决定是否回退
     # auto -> 有效 IQ + 成功加载模型时走 CNN，否则走 rule
